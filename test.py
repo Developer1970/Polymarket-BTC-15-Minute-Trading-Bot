@@ -27,7 +27,7 @@ async def test_gamma_api():
             "closed": "false",
             "archived": "false",
             "limit": 50,
-            "slug": "btc-updown-15m-1771140600"  # Use the specific slug we know exists
+            "slug": "btc-updown-15m-1786303800"  # Use the specific slug we know exists
         }
         
         response1 = await client.get(f"{base_url}/markets", params=params1)
@@ -40,12 +40,12 @@ async def test_gamma_api():
             print(f"   Error: {response1.status_code}")
         
         # Test 2: Get markets with crypto tag
-        print("\n2. Testing: Markets with crypto tag (744)")
+        print("\n2. Testing: Markets with crypto tag (21)")
         params2 = {
             "active": "true",
             "closed": "false",
             "archived": "false",
-            "tag_id": 744,
+            "tag_id": 21,
             "limit": 20
         }
         
@@ -86,7 +86,7 @@ async def test_gamma_api():
             "active": "true",
             "closed": "false",
             "archived": "false",
-            "tag_id": 744,
+            "tag_id": 21,
             "end_date_min": now.isoformat(),
             "end_date_max": (now + timedelta(minutes=30)).isoformat(),
             "limit": 50
