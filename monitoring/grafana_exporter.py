@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from monitoring.performance_tracker import get_performance_tracker
 from execution.risk_engine import get_risk_engine
-from execution.execution_engine import get_execution_engine
+# from execution.execution_engine import get_execution_engine
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
@@ -192,7 +192,7 @@ class GrafanaMetricsExporter:
         # Components
         self.performance = get_performance_tracker()
         self.risk = get_risk_engine()
-        self.execution = get_execution_engine()
+        # self.execution = get_execution_engine()
         
         # Prometheus metrics
         self._setup_metrics()
@@ -337,11 +337,11 @@ class GrafanaMetricsExporter:
                 )
             
             # Get execution stats
-            exec_stats = self.execution.get_statistics()
+            # exec_stats = self.execution.get_statistics()
             
-            if exec_stats:
-                # Update counters if needed
-                pass
+            # if exec_stats:
+            #     # Update counters if needed
+            #     pass
             
             logger.debug("Metrics updated successfully")
             

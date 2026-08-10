@@ -3,12 +3,16 @@ Performance Tracker
 Tracks and analyzes trading performance metrics
 """
 import asyncio
+import json
+import os
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from collections import deque
 from loguru import logger
+
+PERFORMANCE_STATE_FILE = "performance_state.json"
 
 
 @dataclass
@@ -80,28 +84,97 @@ class PerformanceTracker:
     ):
         """
         Initialize performance tracker.
-        
+
         Args:
             initial_capital: Starting capital
         """
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
-        
+
         # Trade history
         self._trades: List[Trade] = []
         self._max_trades_history = 1000
-        
+
         # Metrics history (for Grafana)
         self._metrics_history: deque = deque(maxlen=10000)
-        
+
         # Performance cache
         self._last_metrics: Optional[PerformanceMetrics] = None
         self._metrics_dirty = True
-        
+
         # Peak tracking for drawdown
         self._peak_capital = initial_capital
-        
-        logger.info(f"Initialized Performance Tracker (capital=${initial_capital})")
+
+        # Reload state from a prior process (the bot auto-restarts periodically;
+        # without this, capital/trade history reset to defaults every restart).
+        self._load_state()
+
+        logger.info(f"Initialized Performance Tracker (capital=${self.current_capital})")
+
+    def _trade_to_dict(self, trade: Trade) -> Dict[str, Any]:
+        return {
+            'trade_id': trade.trade_id,
+            'timestamp': trade.timestamp.isoformat(),
+            'direction': trade.direction,
+            'entry_price': str(trade.entry_price),
+            'exit_price': str(trade.exit_price),
+            'size': str(trade.size),
+            'pnl': str(trade.pnl),
+            'pnl_pct': trade.pnl_pct,
+            'duration_seconds': trade.duration_seconds,
+            'signal_score': trade.signal_score,
+            'signal_confidence': trade.signal_confidence,
+            'metadata': trade.metadata,
+        }
+
+    def _trade_from_dict(self, d: Dict[str, Any]) -> Trade:
+        return Trade(
+            trade_id=d['trade_id'],
+            timestamp=datetime.fromisoformat(d['timestamp']),
+            direction=d['direction'],
+            entry_price=Decimal(d['entry_price']),
+            exit_price=Decimal(d['exit_price']),
+            size=Decimal(d['size']),
+            pnl=Decimal(d['pnl']),
+            pnl_pct=d['pnl_pct'],
+            duration_seconds=d['duration_seconds'],
+            signal_score=d['signal_score'],
+            signal_confidence=d['signal_confidence'],
+            metadata=d.get('metadata', {}),
+        )
+
+    def _load_state(self) -> None:
+        if not os.path.exists(PERFORMANCE_STATE_FILE):
+            return
+        try:
+            with open(PERFORMANCE_STATE_FILE, 'r') as f:
+                state = json.load(f)
+            self.initial_capital = Decimal(state['initial_capital'])
+            self.current_capital = Decimal(state['current_capital'])
+            self._peak_capital = Decimal(state['peak_capital'])
+            self._trades = [self._trade_from_dict(t) for t in state.get('trades', [])]
+            self._metrics_dirty = True
+            logger.info(
+                f"Restored Performance Tracker state: {len(self._trades)} trade(s), "
+                f"capital=${self.current_capital}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load performance state from {PERFORMANCE_STATE_FILE}: {e}")
+
+    def save_to_file(self) -> None:
+        try:
+            if len(self._trades) > self._max_trades_history:
+                self._trades = self._trades[-self._max_trades_history:]
+            state = {
+                'initial_capital': str(self.initial_capital),
+                'current_capital': str(self.current_capital),
+                'peak_capital': str(self._peak_capital),
+                'trades': [self._trade_to_dict(t) for t in self._trades],
+            }
+            with open(PERFORMANCE_STATE_FILE, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save performance state: {e}")
     
     def record_trade(
         self,
@@ -177,12 +250,14 @@ class PerformanceTracker:
         
         # Mark metrics as dirty
         self._metrics_dirty = True
-        
+
         logger.info(
             f"Recorded trade: {trade_id} "
             f"{direction.upper()} P&L=${pnl:+.2f} ({pnl_pct:+.2%})"
         )
-        
+
+        self.save_to_file()
+
         return trade
     
     def calculate_metrics(self, force: bool = False) -> PerformanceMetrics:
