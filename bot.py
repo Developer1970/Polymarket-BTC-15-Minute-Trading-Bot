@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -44,7 +45,6 @@ from nautilus_trader.adapters.polymarket.factories import (
 
 from dotenv import load_dotenv
 from loguru import logger
-import redis
 
 load_dotenv()
 from patch_market_orders import apply_market_order_patch
@@ -61,25 +61,7 @@ from core.strategy_brain.strategies.integrated_btc_strategy import (
     QUOTE_STABILITY_REQUIRED,
 )
 from monitoring.grafana_exporter import get_grafana_exporter
-
-def init_redis():
-    """Initialize Redis connection for simulation mode control."""
-    try:
-        redis_client = redis.Redis(
-            host=os.getenv('REDIS_HOST', 'localhost'),
-            port=int(os.getenv('REDIS_PORT', 6379)),
-            db=int(os.getenv('REDIS_DB', 2)),
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_keepalive=True
-        )
-        redis_client.ping()
-        logger.info("Redis connection established")
-        return redis_client
-    except Exception as e:
-        logger.warning(f"Redis connection failed: {e}")
-        logger.warning("Simulation mode will be static (from .env)")
-        return None
+from core.redis_client import get_redis_client
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +117,30 @@ def _stop_grafana(exporter) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auto-restart
+#
+# Process lifecycle — it just kills the process so
+# 15m_bot_runner.py's wrapper loop relaunches it with fresh filters.
+# ---------------------------------------------------------------------------
+
+RESTART_AFTER_MINUTES = 90
+
+
+def _trigger_restart() -> None:
+    logger.warning("AUTO-RESTART TIME - Loading fresh filters")
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
+def run_integrated_bot(
+    simulation: bool = False,
+    enable_grafana: bool = True,
+    test_mode: bool = False,
+    restart_after_minutes: int = RESTART_AFTER_MINUTES,
+):
     """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
 
     print("=" * 80)
@@ -146,7 +148,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
 
-    redis_client = init_redis()
+    redis_client = get_redis_client()
 
     if redis_client:
         try:
@@ -242,7 +244,6 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     )
 
     strategy = IntegratedBTCStrategy(
-        redis_client=redis_client,
         enable_grafana=enable_grafana,
         test_mode=test_mode,
     )
@@ -260,6 +261,10 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         _start_grafana(grafana_exporter)
         logger.info("Grafana metrics started on port 8000")
 
+    restart_timer = threading.Timer(restart_after_minutes * 60, _trigger_restart)
+    restart_timer.daemon = True
+    restart_timer.start()
+
     print()
     print("=" * 80)
     print("BOT STARTING")
@@ -270,6 +275,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
+        restart_timer.cancel()
         node.dispose()
         if grafana_exporter:
             _stop_grafana(grafana_exporter)

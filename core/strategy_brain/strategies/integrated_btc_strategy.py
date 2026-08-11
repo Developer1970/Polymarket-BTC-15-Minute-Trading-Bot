@@ -30,6 +30,7 @@ from nautilus_trader.model.data import QuoteTick
 
 from core.market_finder.market_data import MarketData
 from core.market_finder.btc_15min_market_finder import BTC15minActiveMarketFinder
+from core.redis_client import get_redis_client
 
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
 from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
@@ -50,15 +51,6 @@ from feedback.learning_engine import get_learning_engine
 QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
 PAPER_TRADES_FILE = "paper_trades.json"
 MAX_PAPER_TRADES_HISTORY = 1000   # matches PerformanceTracker's _max_trades_history
-# _record_paper_trade's simulated exit moves at most -8%/+8% from entry (see
-# `movement = random.uniform(...)` there). These must be inside that range or
-# they can never actually clamp anything — a wide threshold like 20-30% would
-# silently never trigger, which is the "not functioning" bug this exists to
-# fix. Stop-loss is tight (trades enter at minute 13-14 of a 15-min market,
-# when the outcome is nearly decided, so a sharp reversal is the rare case);
-# take-profit has more room since late-window entries are usually right.
-STOP_LOSS_PCT = 0.01               # 1% adverse move clamps the simulated exit
-TAKE_PROFIT_PCT = 0.05             # 5% favorable move clamps the simulated exit
 
 
 @dataclass
@@ -73,7 +65,6 @@ class PaperTrade:
     outcome: str = "PENDING"
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
-    exit_reason: str = "TIME"  # "STOP_LOSS" | "TAKE_PROFIT" | "TIME"
 
     def to_dict(self):
         return {
@@ -86,7 +77,6 @@ class PaperTrade:
             'outcome': self.outcome,
             'exit_price': self.exit_price,
             'pnl': self.pnl,
-            'exit_reason': self.exit_reason,
         }
 
     @classmethod
@@ -102,7 +92,6 @@ class PaperTrade:
             # Older records (before P&L was tracked) won't have these — default to unknown.
             exit_price=d.get('exit_price'),
             pnl=d.get('pnl'),
-            exit_reason=d.get('exit_reason', 'TIME'),
         )
 
 
@@ -114,19 +103,14 @@ class IntegratedBTCStrategy(Strategy):
     - Correct timing for market switching
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(self, enable_grafana=True, test_mode=False):
         super().__init__()
 
-        self.bot_start_time = datetime.now(timezone.utc)
-        self.restart_after_minutes = 90
-
-        # Nautilus
-        self.instrument_id = None
-        self.redis_client = redis_client
-        self.current_simulation_mode = False
-
         # Market finder — finds which BTC 15-min market to trade. Strategy
-        # only knows the MarketData it returns (see _apply_market).
+        # only knows the MarketData it returns. instrument_id/_yes_token_id/
+        # _no_instrument_id are NOT stored separately — they're properties
+        # below that read straight from current_market, so there's exactly
+        # one source of truth and no risk of them going stale relative to it.
         self.market_finder: Optional[BTC15minActiveMarketFinder] = None
         self.current_market: Optional[MarketData] = None
         self.next_switch_time: Optional[datetime] = None
@@ -134,7 +118,6 @@ class IntegratedBTCStrategy(Strategy):
         # Quote-stability tracking
         self._stable_tick_count = 0
         self._market_stable = False
-        self._last_instrument_switch = None
 
         # =========================================================================
         # FIX 1: Force first trade by setting last_trade_time to -1
@@ -145,10 +128,6 @@ class IntegratedBTCStrategy(Strategy):
 
         # Tick buffer: rolling 90s of ticks for TickVelocityProcessor
         self._tick_buffer: deque = deque(maxlen=500)  # ~500 ticks = well over 90s
-
-        # YES token id for the current market (set via _apply_market)
-        self._yes_token_id: Optional[str] = None
-        self._no_instrument_id = None
 
         # Phase 4: Signal Processors
         self.spike_detector = SpikeDetectionProcessor(
@@ -207,8 +186,9 @@ class IntegratedBTCStrategy(Strategy):
         self.max_history = 100
 
         # Paper trading tracker — reload prior sessions' trades so a restart
-        # (auto-restart fires every restart_after_minutes) doesn't clobber
-        # paper_trades.json with just the new session's trades.
+        # (the runner periodically kills and relaunches the process — see
+        # run_integrated_bot) doesn't clobber paper_trades.json with just
+        # the new session's trades.
         self.paper_trades: List[PaperTrade] = self._load_paper_trades()
 
         self.test_mode = test_mode
@@ -228,27 +208,46 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
 
     # ------------------------------------------------------------------
+    # Current-market accessors — derived from current_market, not stored
+    # ------------------------------------------------------------------
+
+    @property
+    def instrument_id(self):
+        """The instrument to trade/subscribe against (current_market's YES/primary token)."""
+        return self.current_market.instrument_id if self.current_market else None
+
+    @property
+    def _yes_token_id(self):
+        """Raw CLOB token id for the current market's YES token (for REST calls)."""
+        return self.current_market.yes_token_id if self.current_market else None
+
+    @property
+    def _no_instrument_id(self):
+        """The current market's NO/DOWN token instrument id, if known."""
+        return self.current_market.no_instrument_id if self.current_market else None
+
+    # ------------------------------------------------------------------
     # Redis
     # ------------------------------------------------------------------
 
     async def check_simulation_mode(self) -> bool:
-        """Check Redis for current simulation mode."""
-        if not self.redis_client:
-            return self.current_simulation_mode
+        """
+        Return whether the bot should currently be trading in simulation
+        (paper) mode. Redis ('btc_trading:simulation_mode') is the source of
+        truth — it's toggleable at runtime via redis_control.py — so this
+        always reads it fresh rather than caching the result. Falls back to
+        LIVE (False) if Redis isn't configured or unreachable.
+        """
+        redis_client = get_redis_client()
+        if not redis_client:
+            return False
         try:
-            sim_mode = self.redis_client.get('btc_trading:simulation_mode')
+            sim_mode = redis_client.get('btc_trading:simulation_mode')
             if sim_mode is not None:
-                redis_simulation = sim_mode == '1'
-                if redis_simulation != self.current_simulation_mode:
-                    self.current_simulation_mode = redis_simulation
-                    mode_text = "SIMULATION" if redis_simulation else "LIVE TRADING"
-                    logger.warning(f"Trading mode changed to: {mode_text}")
-                    if not redis_simulation:
-                        logger.warning("LIVE TRADING ACTIVE - Real money at risk!")
-                return redis_simulation
+                return sim_mode == '1'
         except Exception as e:
             logger.warning(f"Failed to check Redis simulation mode: {e}")
-        return self.current_simulation_mode
+        return False
 
     # ------------------------------------------------------------------
     # Strategy lifecycle
@@ -265,7 +264,7 @@ class IntegratedBTCStrategy(Strategy):
         # =========================================================================
         self.market_finder = BTC15minActiveMarketFinder(self.cache)
         market = self.market_finder.load()
-        self._apply_market(market)
+        self.current_market = market
 
         now = datetime.now(timezone.utc)
         if market.is_open(now):
@@ -276,12 +275,12 @@ class IntegratedBTCStrategy(Strategy):
             self._waiting_for_market_open = True
             logger.info(f"  Starts at {market.start_time.strftime('%H:%M:%S')} UTC — waiting for it to open")
 
-        self.subscribe_quote_ticks(self.instrument_id)
-        logger.info(f"✓ SUBSCRIBED to market: {self.instrument_id}")
+        self.subscribe_quote_ticks(market.instrument_id)
+        logger.info(f"✓ SUBSCRIBED to market: {market.instrument_id}")
 
         # Try to get current price from cache
         try:
-            quote = self.cache.quote_tick(self.instrument_id)
+            quote = self.cache.quote_tick(market.instrument_id)
             if quote and quote.bid_price and quote.ask_price:
                 current_price = (quote.bid_price + quote.ask_price) / 2
                 self.price_history.append(current_price)
@@ -304,16 +303,12 @@ class IntegratedBTCStrategy(Strategy):
         if self.next_switch_time:
             self._schedule_market_switch(self.next_switch_time)
 
-        restart_time = self.bot_start_time + timedelta(minutes=self.restart_after_minutes)
-        self.clock.set_time_alert(
-            "auto_restart", restart_time, callback=self._on_restart_alert, override=True,
-        )
-
-        # Grafana's HTTP server lifecycle is process-level infra, not strategy
-        # logic — it's started/stopped by the runner (run_integrated_bot),
-        # not here. self.grafana_exporter (see __init__) is only used to
-        # record metrics (increment_trade_counter, record_trade_duration),
-        # which works regardless of who started the server.
+        # Auto-restart (kill the process after N minutes so 15m_bot_runner.py
+        # relaunches it with fresh filters) is process lifecycle, not strategy
+        # logic — it's handled by the runner (run_integrated_bot), not here.
+        # Same reasoning as Grafana below: self.grafana_exporter (see __init__)
+        # is only used to record metrics (increment_trade_counter,
+        # record_trade_duration), the HTTP server itself is owned by the runner.
 
         logger.info("=" * 80)
         logger.info("Strategy active - will trade every 15 minutes")
@@ -344,13 +339,6 @@ class IntegratedBTCStrategy(Strategy):
     # Market switching
     # ------------------------------------------------------------------
 
-    def _apply_market(self, market: MarketData) -> None:
-        """Adopt a MarketData as the market this strategy is currently trading."""
-        self.current_market = market
-        self.instrument_id = market.instrument_id
-        self._yes_token_id = market.yes_token_id
-        self._no_instrument_id = market.no_instrument_id
-
     def _switch_to_next_market(self) -> bool:
         """Ask the market finder to advance, and adopt the new market if it's ready."""
         next_market = self.market_finder.advance()
@@ -358,7 +346,7 @@ class IntegratedBTCStrategy(Strategy):
             return False
 
         old_instrument_id = self.instrument_id
-        self._apply_market(next_market)
+        self.current_market = next_market
         self.next_switch_time = next_market.end_time
 
         logger.info("=" * 80)
@@ -436,15 +424,10 @@ class IntegratedBTCStrategy(Strategy):
             self._schedule_market_switch(self.next_switch_time)
         else:
             # Next market not loaded yet or not ready — retry shortly, same
-            # cadence as the old poll loop, until the auto-restart alert fires.
+            # cadence as the old poll loop, until the runner's periodic
+            # process restart (see run_integrated_bot) eventually bounds it.
             retry_at = datetime.now(timezone.utc) + timedelta(seconds=10)
             self._schedule_market_switch(retry_at)
-
-    def _on_restart_alert(self, event):
-        """Fired once by the strategy clock after restart_after_minutes uptime."""
-        logger.warning("AUTO-RESTART TIME - Loading fresh filters")
-        import signal as _signal
-        os.kill(os.getpid(), _signal.SIGTERM)
 
     # ------------------------------------------------------------------
     # Quote tick handler - SIMPLIFIED
@@ -600,7 +583,7 @@ class IntegratedBTCStrategy(Strategy):
             import traceback
             traceback.print_exc()
 
-    async def _fetch_market_context(self, current_price: Decimal) -> dict:
+    async def _fetch_market_metadata(self, current_price: Decimal) -> dict:
         """
         Fetch REAL external data to populate signal processor metadata.
 
@@ -696,7 +679,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"Current price: ${float(current_price):,.4f}")
 
         # --- Phase 4a: Build real metadata for processors ---
-        metadata = await self._fetch_market_context(current_price)
+        metadata = await self._fetch_market_metadata(current_price)
 
         # --- Phase 4b: Run all three signal processors ---
         signals = self._process_signals(current_price, metadata)
@@ -779,25 +762,6 @@ class IntegratedBTCStrategy(Strategy):
 
         logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
 
-        # --- Stop-loss / take-profit levels ---
-        # These bound how much the simulated paper-trade exit can move against
-        # or in favor of us (see _record_paper_trade). For LIVE orders they're
-        # informational only — Polymarket orders here are BUY-and-hold-to-
-        # resolution (no active position monitoring/selling exists), and the
-        # trade window (13-14 min into a 15-min market) leaves at most ~1-2
-        # minutes before settlement anyway, so there's no real window for an
-        # early exit to matter. Logged so the levels are visible, not enforced.
-        if direction == "long":
-            stop_loss_price = max(Decimal("0.01"), current_price * (Decimal("1") - Decimal(str(STOP_LOSS_PCT))))
-            take_profit_price = min(Decimal("0.99"), current_price * (Decimal("1") + Decimal(str(TAKE_PROFIT_PCT))))
-        else:
-            stop_loss_price = min(Decimal("0.99"), current_price * (Decimal("1") + Decimal(str(STOP_LOSS_PCT))))
-            take_profit_price = max(Decimal("0.01"), current_price * (Decimal("1") - Decimal(str(TAKE_PROFIT_PCT))))
-        logger.info(
-            f"Risk levels: stop_loss=${float(stop_loss_price):.4f} "
-            f"take_profit=${float(take_profit_price):.4f}"
-        )
-
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
         # If ask <= 0.02 or bid <= 0.02, the orderbook is essentially empty
@@ -821,17 +785,11 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- Phase 5 / 6: Execute ---
         if is_simulation:
-            await self._record_paper_trade(
-                fused, POSITION_SIZE_USD, current_price, direction, stop_loss_price, take_profit_price,
-            )
+            await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
         else:
-            await self._place_real_order(
-                fused, POSITION_SIZE_USD, current_price, direction, stop_loss_price, take_profit_price,
-            )
+            await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
 
-    async def _record_paper_trade(
-        self, signal, position_size, current_price, direction, stop_loss_price, take_profit_price,
-    ):
+    async def _record_paper_trade(self, signal, position_size, current_price, direction):
         """
         Simulate a paper trade's exit and record its P&L.
 
@@ -839,9 +797,12 @@ class IntegratedBTCStrategy(Strategy):
         settle on-chain automatically (no sell, no fill/close event Nautilus
         can react to — see the note in _place_real_order), so there's no
         real exit event to record for either live or paper trades. This
-        generates a plausible one, clamped to stop_loss_price/take_profit_price
-        so those levels actually bound the simulated outcome instead of being
-        pure decoration.
+        generates a plausible one instead.
+
+        No stop-loss/take-profit here: this bot buys and holds to market
+        resolution (there is no sell path — see _place_real_order), so
+        there's no early-exit mechanism for a stop-loss/take-profit to
+        actually act on. They'd be pure decoration on a one-shot bet.
         """
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
@@ -851,22 +812,8 @@ class IntegratedBTCStrategy(Strategy):
         else:
             movement = random.uniform(-0.08, 0.02)
 
-        raw_exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
-
-        # Clamp the simulated exit to the stop-loss/take-profit bounds so they
-        # actually constrain the outcome rather than sitting unused.
-        if direction == "long":
-            exit_price = max(stop_loss_price, min(take_profit_price, raw_exit_price))
-        else:
-            exit_price = min(stop_loss_price, max(take_profit_price, raw_exit_price))
+        exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
         exit_price = max(Decimal("0.01"), min(Decimal("0.99"), exit_price))
-
-        if exit_price == take_profit_price:
-            exit_reason = "TAKE_PROFIT"
-        elif exit_price == stop_loss_price:
-            exit_reason = "STOP_LOSS"
-        else:
-            exit_reason = "TIME"
 
         if direction == "long":
             pnl = position_size * (exit_price - current_price) / current_price
@@ -884,7 +831,6 @@ class IntegratedBTCStrategy(Strategy):
             outcome=outcome,
             exit_price=float(exit_price),
             pnl=float(pnl),
-            exit_reason=exit_reason,
         )
         self.paper_trades.append(paper_trade)
 
@@ -902,7 +848,6 @@ class IntegratedBTCStrategy(Strategy):
                 "simulated": True,
                 "num_signals": signal.num_signals if hasattr(signal, 'num_signals') else 1,
                 "fusion_score": signal.score,
-                "exit_reason": exit_reason,
             }
         )
 
@@ -915,7 +860,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"  Direction: {direction.upper()}")
         logger.info(f"  Size: ${float(position_size):.2f}")
         logger.info(f"  Entry Price: ${float(current_price):,.4f}")
-        logger.info(f"  Simulated Exit: ${float(exit_price):,.4f} ({exit_reason})")
+        logger.info(f"  Simulated Exit: ${float(exit_price):,.4f}")
         logger.info(f"  Simulated P&L: ${float(pnl):+.2f} ({movement*100:+.2f}%)")
         logger.info(f"  Outcome: {outcome}")
         logger.info(f"  Total Paper Trades: {len(self.paper_trades)}")
@@ -950,9 +895,7 @@ class IntegratedBTCStrategy(Strategy):
     # Real order (unchanged)
     # ------------------------------------------------------------------
 
-    async def _place_real_order(
-        self, signal, position_size, current_price, direction, stop_loss_price, take_profit_price,
-    ):
+    async def _place_real_order(self, signal, position_size, current_price, direction):
         if not self.instrument_id:
             logger.error("No instrument available")
             return
@@ -962,24 +905,13 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("LIVE MODE - PLACING REAL ORDER!")
             logger.info("=" * 80)
 
-            # NOTE: stop_loss_price/take_profit_price are logged for visibility
-            # only — they are NOT enforced. There is no active monitoring or
-            # SELL path here: Polymarket orders are BUY-and-hold-to-resolution
-            # (both UP and DOWN bets are BUY orders — see below), and the
-            # trade window (13-14 min into a 15-min market) leaves at most
-            # ~1-2 minutes before the market settles automatically on-chain
-            # anyway, so an early exit has essentially no window to matter.
-            # An actual stop-loss would require subscribing to post-entry
-            # ticks and submitting a SELL order on breach — not built.
-            logger.info(
-                f"  Risk levels (informational only): "
-                f"stop_loss=${float(stop_loss_price):.4f} take_profit=${float(take_profit_price):.4f}"
-            )
-
             # On Polymarket, both UP and DOWN are BUY orders.
             # Bullish = buy YES token (self.instrument_id — the market's primary/YES token)
             # Bearish = buy NO token  (self._no_instrument_id)
-            # There is NO sell — you always buy whichever side you want.
+            # There is NO sell — you always buy whichever side you want, and
+            # hold to market resolution. That means there's no stop-loss/
+            # take-profit here: both require an early-exit mechanism (a SELL)
+            # that doesn't exist for this strategy — it's a one-shot bet.
             side = OrderSide.BUY
 
             if direction == "long":
@@ -1190,8 +1122,7 @@ class IntegratedBTCStrategy(Strategy):
     def on_stop(self):
         logger.info("Integrated BTC strategy stopped")
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
-        for name in ("market_switch", "auto_restart"):
-            if name in self.clock.timer_names:
-                self.clock.cancel_timer(name)
-        # Grafana's HTTP server is started/stopped by the runner
-        # (run_integrated_bot), not here — see on_start.
+        if "market_switch" in self.clock.timer_names:
+            self.clock.cancel_timer("market_switch")
+        # Grafana's HTTP server and the auto-restart timer are started/
+        # stopped by the runner (run_integrated_bot), not here — see on_start.
