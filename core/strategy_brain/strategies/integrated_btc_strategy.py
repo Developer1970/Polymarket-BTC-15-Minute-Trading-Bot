@@ -50,6 +50,15 @@ from feedback.learning_engine import get_learning_engine
 QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
 PAPER_TRADES_FILE = "paper_trades.json"
 MAX_PAPER_TRADES_HISTORY = 1000   # matches PerformanceTracker's _max_trades_history
+# _record_paper_trade's simulated exit moves at most -8%/+8% from entry (see
+# `movement = random.uniform(...)` there). These must be inside that range or
+# they can never actually clamp anything — a wide threshold like 20-30% would
+# silently never trigger, which is the "not functioning" bug this exists to
+# fix. Stop-loss is tight (trades enter at minute 13-14 of a 15-min market,
+# when the outcome is nearly decided, so a sharp reversal is the rare case);
+# take-profit has more room since late-window entries are usually right.
+STOP_LOSS_PCT = 0.01               # 1% adverse move clamps the simulated exit
+TAKE_PROFIT_PCT = 0.05             # 5% favorable move clamps the simulated exit
 
 
 @dataclass
@@ -62,6 +71,9 @@ class PaperTrade:
     signal_score: float
     signal_confidence: float
     outcome: str = "PENDING"
+    exit_price: Optional[float] = None
+    pnl: Optional[float] = None
+    exit_reason: str = "TIME"  # "STOP_LOSS" | "TAKE_PROFIT" | "TIME"
 
     def to_dict(self):
         return {
@@ -72,6 +84,9 @@ class PaperTrade:
             'signal_score': self.signal_score,
             'signal_confidence': self.signal_confidence,
             'outcome': self.outcome,
+            'exit_price': self.exit_price,
+            'pnl': self.pnl,
+            'exit_reason': self.exit_reason,
         }
 
     @classmethod
@@ -84,6 +99,10 @@ class PaperTrade:
             signal_score=d['signal_score'],
             signal_confidence=d['signal_confidence'],
             outcome=d.get('outcome', 'PENDING'),
+            # Older records (before P&L was tracked) won't have these — default to unknown.
+            exit_price=d.get('exit_price'),
+            pnl=d.get('pnl'),
+            exit_reason=d.get('exit_reason', 'TIME'),
         )
 
 
@@ -290,9 +309,11 @@ class IntegratedBTCStrategy(Strategy):
             "auto_restart", restart_time, callback=self._on_restart_alert, override=True,
         )
 
-        if self.grafana_exporter:
-            import threading
-            threading.Thread(target=self._start_grafana_sync, daemon=True).start()
+        # Grafana's HTTP server lifecycle is process-level infra, not strategy
+        # logic — it's started/stopped by the runner (run_integrated_bot),
+        # not here. self.grafana_exporter (see __init__) is only used to
+        # record metrics (increment_trade_counter, record_trade_duration),
+        # which works regardless of who started the server.
 
         logger.info("=" * 80)
         logger.info("Strategy active - will trade every 15 minutes")
@@ -758,6 +779,25 @@ class IntegratedBTCStrategy(Strategy):
 
         logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
 
+        # --- Stop-loss / take-profit levels ---
+        # These bound how much the simulated paper-trade exit can move against
+        # or in favor of us (see _record_paper_trade). For LIVE orders they're
+        # informational only — Polymarket orders here are BUY-and-hold-to-
+        # resolution (no active position monitoring/selling exists), and the
+        # trade window (13-14 min into a 15-min market) leaves at most ~1-2
+        # minutes before settlement anyway, so there's no real window for an
+        # early exit to matter. Logged so the levels are visible, not enforced.
+        if direction == "long":
+            stop_loss_price = max(Decimal("0.01"), current_price * (Decimal("1") - Decimal(str(STOP_LOSS_PCT))))
+            take_profit_price = min(Decimal("0.99"), current_price * (Decimal("1") + Decimal(str(TAKE_PROFIT_PCT))))
+        else:
+            stop_loss_price = min(Decimal("0.99"), current_price * (Decimal("1") + Decimal(str(STOP_LOSS_PCT))))
+            take_profit_price = max(Decimal("0.01"), current_price * (Decimal("1") - Decimal(str(TAKE_PROFIT_PCT))))
+        logger.info(
+            f"Risk levels: stop_loss=${float(stop_loss_price):.4f} "
+            f"take_profit=${float(take_profit_price):.4f}"
+        )
+
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
         # If ask <= 0.02 or bid <= 0.02, the orderbook is essentially empty
@@ -781,11 +821,28 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- Phase 5 / 6: Execute ---
         if is_simulation:
-            await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
+            await self._record_paper_trade(
+                fused, POSITION_SIZE_USD, current_price, direction, stop_loss_price, take_profit_price,
+            )
         else:
-            await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
+            await self._place_real_order(
+                fused, POSITION_SIZE_USD, current_price, direction, stop_loss_price, take_profit_price,
+            )
 
-    async def _record_paper_trade(self, signal, position_size, current_price, direction):
+    async def _record_paper_trade(
+        self, signal, position_size, current_price, direction, stop_loss_price, take_profit_price,
+    ):
+        """
+        Simulate a paper trade's exit and record its P&L.
+
+        Stands in for a real on_position_closed: Polymarket binary options
+        settle on-chain automatically (no sell, no fill/close event Nautilus
+        can react to — see the note in _place_real_order), so there's no
+        real exit event to record for either live or paper trades. This
+        generates a plausible one, clamped to stop_loss_price/take_profit_price
+        so those levels actually bound the simulated outcome instead of being
+        pure decoration.
+        """
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
 
@@ -794,8 +851,22 @@ class IntegratedBTCStrategy(Strategy):
         else:
             movement = random.uniform(-0.08, 0.02)
 
-        exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
+        raw_exit_price = current_price * (Decimal("1.0") + Decimal(str(movement)))
+
+        # Clamp the simulated exit to the stop-loss/take-profit bounds so they
+        # actually constrain the outcome rather than sitting unused.
+        if direction == "long":
+            exit_price = max(stop_loss_price, min(take_profit_price, raw_exit_price))
+        else:
+            exit_price = min(stop_loss_price, max(take_profit_price, raw_exit_price))
         exit_price = max(Decimal("0.01"), min(Decimal("0.99"), exit_price))
+
+        if exit_price == take_profit_price:
+            exit_reason = "TAKE_PROFIT"
+        elif exit_price == stop_loss_price:
+            exit_reason = "STOP_LOSS"
+        else:
+            exit_reason = "TIME"
 
         if direction == "long":
             pnl = position_size * (exit_price - current_price) / current_price
@@ -811,6 +882,9 @@ class IntegratedBTCStrategy(Strategy):
             signal_score=signal.score,
             signal_confidence=signal.confidence,
             outcome=outcome,
+            exit_price=float(exit_price),
+            pnl=float(pnl),
+            exit_reason=exit_reason,
         )
         self.paper_trades.append(paper_trade)
 
@@ -828,6 +902,7 @@ class IntegratedBTCStrategy(Strategy):
                 "simulated": True,
                 "num_signals": signal.num_signals if hasattr(signal, 'num_signals') else 1,
                 "fusion_score": signal.score,
+                "exit_reason": exit_reason,
             }
         )
 
@@ -840,7 +915,7 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"  Direction: {direction.upper()}")
         logger.info(f"  Size: ${float(position_size):.2f}")
         logger.info(f"  Entry Price: ${float(current_price):,.4f}")
-        logger.info(f"  Simulated Exit: ${float(exit_price):,.4f}")
+        logger.info(f"  Simulated Exit: ${float(exit_price):,.4f} ({exit_reason})")
         logger.info(f"  Simulated P&L: ${float(pnl):+.2f} ({movement*100:+.2f}%)")
         logger.info(f"  Outcome: {outcome}")
         logger.info(f"  Total Paper Trades: {len(self.paper_trades)}")
@@ -875,7 +950,9 @@ class IntegratedBTCStrategy(Strategy):
     # Real order (unchanged)
     # ------------------------------------------------------------------
 
-    async def _place_real_order(self, signal, position_size, current_price, direction):
+    async def _place_real_order(
+        self, signal, position_size, current_price, direction, stop_loss_price, take_profit_price,
+    ):
         if not self.instrument_id:
             logger.error("No instrument available")
             return
@@ -884,6 +961,20 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("=" * 80)
             logger.info("LIVE MODE - PLACING REAL ORDER!")
             logger.info("=" * 80)
+
+            # NOTE: stop_loss_price/take_profit_price are logged for visibility
+            # only — they are NOT enforced. There is no active monitoring or
+            # SELL path here: Polymarket orders are BUY-and-hold-to-resolution
+            # (both UP and DOWN bets are BUY orders — see below), and the
+            # trade window (13-14 min into a 15-min market) leaves at most
+            # ~1-2 minutes before the market settles automatically on-chain
+            # anyway, so an early exit has essentially no window to matter.
+            # An actual stop-loss would require subscribing to post-entry
+            # ticks and submitting a SELL order on breach — not built.
+            logger.info(
+                f"  Risk levels (informational only): "
+                f"stop_loss=${float(stop_loss_price):.4f} take_profit=${float(take_profit_price):.4f}"
+            )
 
             # On Polymarket, both UP and DOWN are BUY orders.
             # Bullish = buy YES token (self.instrument_id — the market's primary/YES token)
@@ -1093,18 +1184,8 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Order rejected: {reason}")
 
     # ------------------------------------------------------------------
-    # Grafana / stop
+    # Stop
     # ------------------------------------------------------------------
-
-    def _start_grafana_sync(self):
-        import asyncio
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.grafana_exporter.start())
-            logger.info("Grafana metrics started on port 8000")
-        except Exception as e:
-            logger.error(f"Failed to start Grafana: {e}")
 
     def on_stop(self):
         logger.info("Integrated BTC strategy stopped")
@@ -1112,10 +1193,5 @@ class IntegratedBTCStrategy(Strategy):
         for name in ("market_switch", "auto_restart"):
             if name in self.clock.timer_names:
                 self.clock.cancel_timer(name)
-        if self.grafana_exporter:
-            import asyncio
-            try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.grafana_exporter.stop())
-            except Exception:
-                pass
+        # Grafana's HTTP server is started/stopped by the runner
+        # (run_integrated_bot), not here — see on_start.

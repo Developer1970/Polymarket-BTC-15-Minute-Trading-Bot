@@ -1,12 +1,13 @@
+import asyncio
 import os
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 
 # Add project to path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
-
 
 try:
     from patch_gamma_markets import apply_gamma_markets_patch, verify_patch
@@ -59,7 +60,7 @@ from core.strategy_brain.strategies.integrated_btc_strategy import (
     IntegratedBTCStrategy,
     QUOTE_STABILITY_REQUIRED,
 )
-
+from monitoring.grafana_exporter import get_grafana_exporter
 
 def init_redis():
     """Initialize Redis connection for simulation mode control."""
@@ -79,6 +80,58 @@ def init_redis():
         logger.warning(f"Redis connection failed: {e}")
         logger.warning("Simulation mode will be static (from .env)")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Grafana lifecycle
+#
+# The metrics HTTP server is process-level infra, not strategy logic, so it's
+# owned here rather than by IntegratedBTCStrategy (which only records metrics
+# into the already-running exporter singleton). It needs its own event loop
+# on a background thread since run_integrated_bot() itself is synchronous
+# (node.run() blocks the main thread). Note this loop must be kept alive with
+# run_forever() — calling run_until_complete(exporter.start()) and returning
+# (as the strategy used to do) lets the loop stop right after the update-loop
+# task is scheduled but before it ever executes, so metrics are posted once
+# at startup and never refreshed again. Confirmed with a standalone repro.
+# ---------------------------------------------------------------------------
+
+_grafana_loop: "asyncio.AbstractEventLoop | None" = None
+_grafana_thread: "threading.Thread | None" = None
+
+
+def _start_grafana(exporter) -> None:
+    global _grafana_loop, _grafana_thread
+
+    def _run():
+        global _grafana_loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _grafana_loop = loop
+        try:
+            loop.run_until_complete(exporter.start())
+            loop.run_forever()
+        finally:
+            loop.close()
+
+    _grafana_thread = threading.Thread(target=_run, daemon=True)
+    _grafana_thread.start()
+
+
+def _stop_grafana(exporter) -> None:
+    global _grafana_loop, _grafana_thread
+    if _grafana_loop is None:
+        return
+    try:
+        future = asyncio.run_coroutine_threadsafe(exporter.stop(), _grafana_loop)
+        future.result(timeout=5)
+    except Exception as e:
+        logger.warning(f"Error stopping Grafana exporter: {e}")
+    _grafana_loop.call_soon_threadsafe(_grafana_loop.stop)
+    if _grafana_thread:
+        _grafana_thread.join(timeout=5)
+    _grafana_loop = None
+    _grafana_thread = None
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +255,11 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     node.build()
     logger.info("Nautilus node built successfully")
 
+    grafana_exporter = get_grafana_exporter() if enable_grafana else None
+    if grafana_exporter:
+        _start_grafana(grafana_exporter)
+        logger.info("Grafana metrics started on port 8000")
+
     print()
     print("=" * 80)
     print("BOT STARTING")
@@ -213,6 +271,8 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         print("\nShutting down...")
     finally:
         node.dispose()
+        if grafana_exporter:
+            _stop_grafana(grafana_exporter)
         logger.info("Bot stopped")
 
 def main():
