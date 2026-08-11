@@ -106,24 +106,14 @@ class IntegratedBTCStrategy(Strategy):
     def __init__(self, enable_grafana=True, test_mode=False):
         super().__init__()
 
-        # Market finder — finds which BTC 15-min market to trade. Strategy
-        # only knows the MarketData it returns. instrument_id/_yes_token_id/
-        # _no_instrument_id are NOT stored separately — they're properties
-        # below that read straight from current_market, so there's exactly
-        # one source of truth and no risk of them going stale relative to it.
+        # Market finder — finds which BTC 15-min market to trade. 
         self.market_finder: Optional[BTC15minActiveMarketFinder] = None
         self.current_market: Optional[MarketData] = None
-        self.next_switch_time: Optional[datetime] = None
-
-        # Quote-stability tracking
-        self._stable_tick_count = 0
-        self._market_stable = False
 
         # =========================================================================
         # FIX 1: Force first trade by setting last_trade_time to -1
         # =========================================================================
         self.last_trade_time = -1  # Force first trade immediately!
-        self._waiting_for_market_open = False  # True when waiting for a future market to open
         self._last_bid_ask = None  # (bid_decimal, ask_decimal) from last tick, for liquidity checks
 
         # Tick buffer: rolling 90s of ticks for TickVelocityProcessor
@@ -266,13 +256,7 @@ class IntegratedBTCStrategy(Strategy):
         market = self.market_finder.load()
         self.current_market = market
 
-        now = datetime.now(timezone.utc)
-        if market.is_open(now):
-            self.next_switch_time = market.end_time
-            self._waiting_for_market_open = False
-        else:
-            self.next_switch_time = market.start_time
-            self._waiting_for_market_open = True
+        if not market.is_open(datetime.now(timezone.utc)):
             logger.info(f"  Starts at {market.start_time.strftime('%H:%M:%S')} UTC — waiting for it to open")
 
         self.subscribe_quote_ticks(market.instrument_id)
@@ -292,23 +276,8 @@ class IntegratedBTCStrategy(Strategy):
         if len(self.price_history) < 20:
             self._generate_synthetic_history(target_count=20, existing_count=len(self.price_history))
 
-        # =========================================================================
-        # Schedule market switching via the strategy clock instead of a background
-        # thread. clock.set_time_alert() fires its callback on the kernel thread
-        # (the same thread that dispatches on_quote_tick), so it's safe to call
-        # subscribe_quote_ticks/unsubscribe_quote_ticks from it. A homegrown
-        # asyncio loop on a separate thread is not — Nautilus's message bus and
-        # strategy API are only safe to call from the single kernel thread.
-        # =========================================================================
-        if self.next_switch_time:
-            self._schedule_market_switch(self.next_switch_time)
-
-        # Auto-restart (kill the process after N minutes so 15m_bot_runner.py
-        # relaunches it with fresh filters) is process lifecycle, not strategy
-        # logic — it's handled by the runner (run_integrated_bot), not here.
-        # Same reasoning as Grafana below: self.grafana_exporter (see __init__)
-        # is only used to record metrics (increment_trade_counter,
-        # record_trade_duration), the HTTP server itself is owned by the runner.
+        # Schedule market switching via the strategy clock 
+        self._schedule_market_switch(self._next_switch_time())
 
         logger.info("=" * 80)
         logger.info("Strategy active - will trade every 15 minutes")
@@ -339,6 +308,16 @@ class IntegratedBTCStrategy(Strategy):
     # Market switching
     # ------------------------------------------------------------------
 
+    def _next_switch_time(self) -> datetime:
+        """
+        When the next market-switch alert should fire, derived entirely from
+        current_market: its close time if it's already open, its open time
+        if we're still waiting on it. Not cached — current_market is the
+        single source of truth.
+        """
+        now = datetime.now(timezone.utc)
+        return self.current_market.end_time if self.current_market.is_open(now) else self.current_market.start_time
+
     def _switch_to_next_market(self) -> bool:
         """Ask the market finder to advance, and adopt the new market if it's ready."""
         next_market = self.market_finder.advance()
@@ -347,20 +326,18 @@ class IntegratedBTCStrategy(Strategy):
 
         old_instrument_id = self.instrument_id
         self.current_market = next_market
-        self.next_switch_time = next_market.end_time
 
         logger.info("=" * 80)
         logger.info(f"SWITCHING TO NEXT MARKET: {next_market.slug}")
         logger.info(f"  Current time: {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
-        logger.info(f"  Market ends at: {self.next_switch_time.strftime('%H:%M:%S')}")
+        logger.info(f"  Market ends at: {next_market.end_time.strftime('%H:%M:%S')}")
         logger.info("=" * 80)
 
         # =========================================================================
         # FIX 5: Force stability for new market and reset trade timer correctly
         # =========================================================================
-        self._stable_tick_count = QUOTE_STABILITY_REQUIRED  # Force stable immediately
-        self._market_stable = True
-        self._waiting_for_market_open = False  # Market is now active
+        next_market.stable_tick_count = QUOTE_STABILITY_REQUIRED  # Force stable immediately
+        next_market.is_stable = True
 
         # Reset trade timer so we trade at the NEXT quote we receive
         # Use -1 so any interval will trigger (same as startup)
@@ -400,33 +377,34 @@ class IntegratedBTCStrategy(Strategy):
     def _on_market_switch_alert(self, event):
         """
         Fired by the strategy clock exactly when the current market ends, or
-        when a future market we were waiting on is due to open.
+        when a future market we were waiting on is due to open. Distinguish
+        the two purely from current_market.is_open(now): scheduled precisely
+        for start_time in the "waiting" case (still open at firing time) or
+        end_time in the "active" case (no longer open at firing time) — no
+        separate flag needed to remember which one this alert was for.
         """
-        if self._waiting_for_market_open:
+        now = datetime.now(timezone.utc)
+        if self.current_market.is_open(now):
             # The future market we were waiting for has now opened.
             # Treat it like a market switch so the trade timer resets.
-            now = datetime.now(timezone.utc)
             logger.info("=" * 80)
             logger.info(f"⏰ WAITING MARKET NOW OPEN: {now.strftime('%H:%M:%S')} UTC")
             logger.info("=" * 80)
-            if self.current_market is not None:
-                self.next_switch_time = self.current_market.end_time
-                logger.info(f"  Market ends at {self.next_switch_time.strftime('%H:%M:%S')} UTC")
-            self._waiting_for_market_open = False
-            self._market_stable = True
-            self._stable_tick_count = QUOTE_STABILITY_REQUIRED
+            self.current_market.stable_tick_count = QUOTE_STABILITY_REQUIRED
+            self.current_market.is_stable = True
             self.last_trade_time = -1  # Trade immediately on next tick
+            logger.info(f"  Market ends at {self.current_market.end_time.strftime('%H:%M:%S')} UTC")
             logger.info("  ✓ MARKET OPEN — ready to trade on next tick")
-            self._schedule_market_switch(self.next_switch_time)
+            self._schedule_market_switch(self.current_market.end_time)
             return
 
         if self._switch_to_next_market():
-            self._schedule_market_switch(self.next_switch_time)
+            self._schedule_market_switch(self._next_switch_time())
         else:
             # Next market not loaded yet or not ready — retry shortly, same
             # cadence as the old poll loop, until the runner's periodic
             # process restart (see run_integrated_bot) eventually bounds it.
-            retry_at = datetime.now(timezone.utc) + timedelta(seconds=10)
+            retry_at = now + timedelta(seconds=10)
             self._schedule_market_switch(retry_at)
 
     # ------------------------------------------------------------------
@@ -436,8 +414,9 @@ class IntegratedBTCStrategy(Strategy):
     def on_quote_tick(self, tick: QuoteTick):
         """Handle quote tick - TRADE when market opens and at each 15-min boundary"""
         try:
-            # Only process ticks from current instrument
-            if self.instrument_id is None or tick.instrument_id != self.instrument_id:
+            # Only process ticks from the current market's instrument
+            current_market = self.current_market
+            if current_market is None or tick.instrument_id != current_market.instrument_id:
                 return
 
             now = datetime.now(timezone.utc)
@@ -465,11 +444,11 @@ class IntegratedBTCStrategy(Strategy):
             # Tick buffer for TickVelocityProcessor (rolling 90s window)
             self._tick_buffer.append({'ts': now, 'price': mid_price})
 
-            # Stability gate
-            if not self._market_stable:
-                self._stable_tick_count += 1
-                if self._stable_tick_count >= 1:
-                    self._market_stable = True
+            # Stability gate (per-market — see MarketData.stable_tick_count/is_stable)
+            if not current_market.is_stable:
+                current_market.stable_tick_count += 1
+                if current_market.stable_tick_count >= 1:
+                    current_market.is_stable = True
                     logger.info(f"✓ Market STABLE immediately")
                 else:
                     return
@@ -487,27 +466,20 @@ class IntegratedBTCStrategy(Strategy):
             # This fires once at market open AND once after every interval within
             # the same market if it's a multi-interval market.
             #
-            # If _waiting_for_market_open is True (started before market opens),
-            # we block trading until the timer loop calls _switch_to_next_market.
+            # If the market hasn't opened yet (we subscribed early while
+            # waiting), block trading until the timer alert flips it open.
             # =========================================================================
 
-            # Block trading if waiting for a future market to open
-            if self._waiting_for_market_open:
-                return
-
-            current_market = self.current_market
-            if current_market is None:
+            if not current_market.is_open(now):
                 return
 
             market_start_ts = current_market.market_timestamp  # Slug timestamp = market start (Unix)
             market_length_secs = (current_market.end_time - current_market.start_time).total_seconds()
 
-            # How many intervals have elapsed since this market opened?
+            # How many intervals have elapsed since this market opened? Always
+            # >= 0 here: the is_open(now) check above already guarantees
+            # now >= current_market.start_time (== market_start_ts).
             elapsed_secs = now.timestamp() - market_start_ts
-            if elapsed_secs < 0:
-                # Market hasn't started yet — block
-                return
-
             sub_interval = int(elapsed_secs // market_length_secs)
 
             # Unique trade key: (market_start_timestamp, sub_interval)
@@ -766,7 +738,7 @@ class IntegratedBTCStrategy(Strategy):
         # The current bid/ask come from the last processed quote tick.
         # If ask <= 0.02 or bid <= 0.02, the orderbook is essentially empty
         # and a FAK (IOC market) order will be rejected immediately.
-        last_tick = getattr(self, '_last_bid_ask', None)
+        last_tick = self._last_bid_ask
         if last_tick:
             last_bid, last_ask = last_tick
             MIN_LIQUIDITY = Decimal("0.02")

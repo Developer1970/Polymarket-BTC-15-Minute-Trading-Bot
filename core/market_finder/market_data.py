@@ -4,6 +4,12 @@ active-market finder (e.g. BTC15minActiveMarketFinder) and handed to a
 Strategy to trade against. Deliberately dumb — no market-discovery logic,
 no Nautilus API calls — so it stays reusable across different finders
 (other timeframes) and different strategies.
+
+Not frozen: stable_tick_count/is_stable are quote-stability qualities of
+*this specific market instance*, mutated in place by whichever strategy is
+currently trading it (see IntegratedBTCStrategy.on_quote_tick). The finder
+only ever sets their defaults when it constructs a MarketData; it never
+reads or reasons about them.
 """
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,7 +18,7 @@ from typing import Optional
 from nautilus_trader.model.identifiers import InstrumentId
 
 
-@dataclass(frozen=True)
+@dataclass
 class MarketData:
     """Everything a strategy needs to know about the market it should trade."""
 
@@ -23,6 +29,8 @@ class MarketData:
     market_timestamp: int                    # market start, unix seconds
     start_time: datetime
     end_time: datetime
+    stable_tick_count: int = 0               # quote-stability counter for this market instance
+    is_stable: bool = False                  # whether enough valid quotes have been seen to trust the data
 
     def is_open(self, at: datetime) -> bool:
         """True if this market has started and not yet ended, at the given time."""
