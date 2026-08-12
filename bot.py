@@ -4,49 +4,48 @@ import signal
 import sys
 import threading
 from pathlib import Path
-from datetime import datetime, timezone
 
 # Add project to path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-try:
-    from patch_gamma_markets import apply_gamma_markets_patch, verify_patch
-    patch_applied = apply_gamma_markets_patch()
-    if patch_applied:
-        verify_patch()
-    else:
-        print("ERROR: Failed to apply gamma_market patch")
-        sys.exit(1)
-except ImportError as e:
-    print(f"ERROR: Could not import patch module: {e}")
-    print("Make sure patch_gamma_markets.py is in the same directory")
-    sys.exit(1)
+# nautilus_trader 2.0 moved to a compiled Rust/PyO3 core: no more
+# nautilus_trader.adapters.polymarket.{gamma_markets,providers} Python
+# submodules to monkey-patch, so patch_gamma_markets.py's target no longer
+# exists. It's also no longer needed — PolymarketUpDownEventSlugConfig
+# (see run_integrated_bot) is the native v2 replacement for what that patch
+# was working around (server-side slug/time filtering of Gamma markets).
 
 # Now import Nautilus
-from nautilus_trader.config import (
-    InstrumentProviderConfig,
-    LiveDataEngineConfig,
-    LiveExecEngineConfig,
-    LiveRiskEngineConfig,
-    LoggingConfig,
-    TradingNodeConfig,
-)
-from nautilus_trader.live.node import TradingNode
-from nautilus_trader.adapters.polymarket import POLYMARKET
+from nautilus_trader.common import Environment, FileWriterConfig, LoggerConfig, LogLevel
+from nautilus_trader.config import LiveExecEngineConfig, LiveRiskEngineConfig
+from nautilus_trader.model import StrategyId, TraderId
+from nautilus_trader.live import LiveNode
 from nautilus_trader.adapters.polymarket import (
+    POLYMARKET,
     PolymarketDataClientConfig,
+    PolymarketDataClientFactory,
     PolymarketExecClientConfig,
-)
-from nautilus_trader.adapters.polymarket.factories import (
-    PolymarketLiveDataClientFactory,
-    PolymarketLiveExecClientFactory,
+    PolymarketExecutionClientFactory,
+    PolymarketInstrumentProviderConfig,
+    PolymarketUpDownEventSlugConfig,
+    SignatureType,
 )
 
 from dotenv import load_dotenv
 from loguru import logger
 
 load_dotenv()
+
+# patch_market_orders.py monkey-patches PolymarketExecutionClient._submit_market_order
+# (a pure-Python v1 class) to force BUY market orders to use a USD notional
+# instead of a token quantity. That class no longer exists in v2 (compiled
+# Rust core, same as gamma_markets above), so this patch can't apply — it
+# fails its own ImportError handling and just logs a warning below, it
+# doesn't crash. BtcUpDown15mStrategy doesn't place orders yet
+# (_evaluate_signal is a stub), so this isn't blocking anything yet, but
+# whatever replaces it will need a v2-native way to submit USD-denominated
+# market BUY orders — investigate that when order placement is implemented.
 from patch_market_orders import apply_market_order_patch
 patch_applied = apply_market_order_patch()
 if patch_applied:
@@ -56,10 +55,7 @@ else:
 
 # Strategy lives in its own module so different strategies/market timeframes
 # can be swapped in later without touching this runner.
-from core.strategy_brain.strategies.integrated_btc_strategy import (
-    IntegratedBTCStrategy,
-    QUOTE_STABILITY_REQUIRED,
-)
+from BtcUpDown15mStrategy import BtcUpDown15mStrategy, BtcUpDown15mConfig
 from monitoring.grafana_exporter import get_grafana_exporter
 from core.redis_client import get_redis_client
 
@@ -68,8 +64,7 @@ from core.redis_client import get_redis_client
 # Grafana lifecycle
 #
 # The metrics HTTP server is process-level infra, not strategy logic, so it's
-# owned here rather than by IntegratedBTCStrategy (which only records metrics
-# into the already-running exporter singleton). It needs its own event loop
+# owned here rather than by the strategy. It needs its own event loop
 # on a background thread since run_integrated_bot() itself is synchronous
 # (node.run() blocks the main thread). Note this loop must be kept alive with
 # run_forever() — calling run_until_complete(exporter.start()) and returning
@@ -167,93 +162,88 @@ def run_integrated_bot(
     print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
     print(f"  Max Trade Size: ${os.getenv('MARKET_BUY_USD', '1.00')}")
-    print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
     print()
 
     # =========================================================================
-    # Slug timestamps ARE standard Unix timestamps (no offset) aligned to
-    # 15-min boundaries. Generate slugs for current + next 24 hours.
+    # PolymarketUpDownEventSlugConfig is the v2-native replacement for the old
+    # manual btc-updown-15m-<unix_ts> slug loop + generic filters={"slug": ...}
+    # hack (which needed patch_gamma_markets.py to work around v1 Gamma API
+    # filtering bugs — see the note near the top of this file). The adapter
+    # now generates and refreshes the slugs itself.
     # =========================================================================
-    now = datetime.now(timezone.utc)
-    unix_interval_start = (int(now.timestamp()) // 900) * 900  # current 15-min boundary
-
-    btc_slugs = []
-    for i in range(-1, 97):  # include 1 prior interval (in case we're just after boundary)
-        timestamp = unix_interval_start + (i * 900)
-        btc_slugs.append(f"btc-updown-15m-{timestamp}")
-
-    filters = {
-        "active": True,
-        "closed": False,
-        "archived": False,
-        "slug": tuple(btc_slugs),
-        "limit": 100,
-    }
-
-    logger.info("=" * 80)
-    logger.info("LOADING BTC 15-MIN MARKETS BY SLUG")
-    logger.info(f"  Interval start: {unix_interval_start} | Count: {len(btc_slugs)}")
-    logger.info(f"  First: {btc_slugs[0]}  Last: {btc_slugs[-1]}")
-    logger.info("=" * 80)
-
-    instrument_cfg = InstrumentProviderConfig(
-        load_all=True,
-        filters=filters,
-        use_gamma_markets=True,
-    )
-
-    poly_data_cfg = PolymarketDataClientConfig(
-        private_key=os.getenv("POLYMARKET_PK"),
-        api_key=os.getenv("POLYMARKET_API_KEY"),
-        api_secret=os.getenv("POLYMARKET_API_SECRET"),
-        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
-        instrument_provider=instrument_cfg,
-    )
-
-    poly_exec_cfg = PolymarketExecClientConfig(
-        private_key=os.getenv("POLYMARKET_PK"),
-        api_key=os.getenv("POLYMARKET_API_KEY"),
-        api_secret=os.getenv("POLYMARKET_API_SECRET"),
-        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-        signature_type=1,
-        instrument_provider=instrument_cfg,
-    )
-
-    config = TradingNodeConfig(
-        environment="live",
-        trader_id="BTC-15MIN-INTEGRATED-001",
-        logging=LoggingConfig(
-            log_level="INFO",
-            log_directory="./logs/nautilus",
-            # Polymarket's book goes one-sided as each market resolves (winning
-            # side -> ~0.999, losing side -> ~0.001/no size), so the adapter's
-            # own drop_quotes_missing_side=True path (the default) logs a
-            # WARNING per dropped tick — expected, not a bug. Since unsubscribe
-            # isn't supported by Polymarket (see _switch_to_next_market), every
-            # market we've switched away from keeps streaming until the next
-            # auto-restart, so these warnings pile up from closed markets too.
-            # Silence them at the component level; real errors still surface.
-            log_component_levels={"DataClient-POLYMARKET": "ERROR"},
+    instrument_config = PolymarketInstrumentProviderConfig(
+        event_slug_builder=PolymarketUpDownEventSlugConfig(
+            assets=["btc"],
+            interval_mins=15,
+            periods=3,
+            start_offset_periods=0,
         ),
-        data_engine=LiveDataEngineConfig(qsize=6000),
-        exec_engine=LiveExecEngineConfig(qsize=6000),
-        risk_engine=LiveRiskEngineConfig(bypass=simulation),
-        data_clients={POLYMARKET: poly_data_cfg},
-        exec_clients={POLYMARKET: poly_exec_cfg},
     )
 
-    strategy = IntegratedBTCStrategy(
-        enable_grafana=enable_grafana,
-        test_mode=test_mode,
+    data_client_config = PolymarketDataClientConfig(
+        instrument_config=instrument_config,
+        update_instruments_interval_mins=15,
+        # subscribe_new_markets subscribes to a PLATFORM-WIDE new-market feed
+        # (every category — sports, esports, politics, everything), not just
+        # markets matching event_slug_builder below. That's what was pulling
+        # in unrelated slugs (e.g. League of Legends markets) and warning
+        # when they didn't produce loadable instruments. We only want BTC
+        # 15-min windows, which event_slug_builder + the 15-min periodic
+        # refresh above already catches as each new window rolls around —
+        # no need for the global feed.
+        subscribe_new_markets=False,
+    )
+
+    # Credentials live only on the exec client config in v2 — the data client
+    # no longer needs them (public market data requires no auth).
+    exec_client_config = PolymarketExecClientConfig(
+        private_key=os.getenv("POLYMARKET_PK"),
+        api_key=os.getenv("POLYMARKET_API_KEY"),
+        api_secret=os.getenv("POLYMARKET_API_SECRET"),
+        passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
+        signature_type=SignatureType.PolyProxy,
+    )
+
+    # Without an explicit strategy_id, Nautilus logs this strategy under a
+    # generic "DataActor-<object id>" component name — unreadable in logs.
+    strategy = BtcUpDown15mStrategy(
+        BtcUpDown15mConfig(strategy_id=StrategyId("BTCUPDOWN15M-001"))
     )
 
     print("\nBuilding Nautilus node...")
-    node = TradingNode(config=config)
-    node.add_data_client_factory(POLYMARKET, PolymarketLiveDataClientFactory)
-    node.add_exec_client_factory(POLYMARKET, PolymarketLiveExecClientFactory)
-    node.trader.add_strategy(strategy)
-    node.build()
+    trader_id = TraderId.from_str("BTC-15MIN-INTEGRATED-001")
+    node = (
+        LiveNode.builder("BTC-15MIN-INTEGRATED-001", trader_id, Environment.LIVE)
+        .with_logging(
+            LoggerConfig(
+                stdout_level=LogLevel.INFO,
+                file_config=FileWriterConfig(directory="./logs/nautilus"),
+                # Polymarket's book goes one-sided as each market resolves (winning
+                # side -> ~0.999, losing side -> ~0.001/no size), so the adapter's
+                # own drop_quotes_missing_side=True path (the default) logs a
+                # WARNING per dropped tick — expected, not a bug. Since unsubscribe
+                # isn't supported by Polymarket, every market we've switched away
+                # from keeps streaming until the next auto-restart, so these
+                # warnings pile up from closed markets too. Silence them at the
+                # component level; real errors still surface.
+                component_levels={
+                    "DataClient-POLYMARKET": "ERROR",
+                    "BTCUPDOWN15M-001": "DEBUG",
+                },
+            )
+        )
+        .with_risk_engine_config(LiveRiskEngineConfig(bypass=simulation))
+        # Reconciliation (the startup "mass status" sync of pre-existing
+        # orders/trades/positions from the venue) is off: this bot is
+        # currently paper-trading only (tuning the predictive algorithm, not
+        # placing real orders), so there's nothing on the venue to sync with.
+        # Re-enable this before any real order placement goes live.
+        .with_exec_engine_config(LiveExecEngineConfig(reconciliation=False))
+        .add_data_client(POLYMARKET, PolymarketDataClientFactory(), data_client_config)
+        .add_exec_client(POLYMARKET, PolymarketExecutionClientFactory(), exec_client_config)
+        .build()
+    )
+    node.add_strategy(strategy)
     logger.info("Nautilus node built successfully")
 
     grafana_exporter = get_grafana_exporter() if enable_grafana else None

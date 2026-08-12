@@ -18,9 +18,8 @@ def apply_gamma_markets_patch():
     """
     try:
         # Import the modules we need to patch
-        from nautilus_trader.adapters.polymarket.common import gamma_markets
+        from nautilus_trader.adapters.polymarket import gamma_markets
         from nautilus_trader.adapters.polymarket import providers
-        from nautilus_trader.core.nautilus_pyo3 import HttpClient
         
         logger.info("=" * 80)
         logger.info("Applying enhanced patches for Polymarket filtering")
@@ -228,7 +227,7 @@ def apply_gamma_markets_patch():
 def verify_patch():
     """Verify that the patch is working."""
     try:
-        from nautilus_trader.adapters.polymarket.common import gamma_markets
+        from nautilus_trader.adapters.polymarket import gamma_markets
         from nautilus_trader.adapters.polymarket import providers
         
         logger.info("=" * 80)
