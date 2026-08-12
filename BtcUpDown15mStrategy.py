@@ -66,16 +66,16 @@ class BtcUpDown15mStrategy(Strategy):
             except Exception as e:
                 # Don't let one bad instrument silently kill the rest of the
                 # loop (or look identical to "nothing happened").
-                self.log.error(f"on_instrument raised for {instrument}: {e!r}")
+                self.log.error(f"on_instrument raised for {self._instrument_label(instrument.id)}: {e!r}")
         self._bootstrapping = False
         # Now that the full startup batch is known, pick correctly (see
         # _select_current_window) instead of per-instrument during the loop.
         self._maybe_activate()
 
     def on_instrument(self, instrument) -> None:
-        self.log.debug(f"on_instrument: {instrument.id} ({type(instrument).__name__})")
+        self.log.info(f"on_instrument: {self._instrument_label(instrument.id)} ({type(instrument).__name__})")
         if not isinstance(instrument, BinaryOption):
-            self.log.debug(f"  reject {instrument.id}: not a BinaryOption")
+            self.log.debug(f"  reject {self._instrument_label(instrument.id)}: not a BinaryOption")
             return
         if not self._belongs_to_family(instrument):
             return  # _belongs_to_family logs its own reason
@@ -88,12 +88,14 @@ class BtcUpDown15mStrategy(Strategy):
         outcome = (instrument.outcome or "").lower()
         if "up" in outcome:
             window["up"] = instrument.id
-            self.log.info(f"BTC 15m window {exp_ns}: UP leg = {instrument.id}")
+            self.log.info(f"BTC 15m window {exp_ns}: UP leg = {self._instrument_label(instrument.id)}")
         elif "down" in outcome:
             window["down"] = instrument.id
-            self.log.info(f"BTC 15m window {exp_ns}: DOWN leg = {instrument.id}")
+            self.log.info(f"BTC 15m window {exp_ns}: DOWN leg = {self._instrument_label(instrument.id)}")
         else:
-            self.log.warning(f"Unrecognized outcome '{instrument.outcome}' for {instrument.id}")
+            self.log.warning(
+                f"Unrecognized outcome '{instrument.outcome}' for {self._instrument_label(instrument.id)}"
+            )
             return
 
         # Once both legs of a window are known, consider activating it.
@@ -103,7 +105,7 @@ class BtcUpDown15mStrategy(Strategy):
 
     def _belongs_to_family(self, instrument: BinaryOption) -> bool:
         if not (hasattr(instrument, 'info') and instrument.info):
-            self.log.debug(f"  reject {instrument.id}: no .info metadata on instrument")
+            self.log.debug(f"  reject {self._instrument_label(instrument.id)}: no .info metadata on instrument")
             return False
         question = instrument.info.get('question', '').lower()
         slug = instrument.info.get('market_slug', '').lower()
@@ -111,7 +113,7 @@ class BtcUpDown15mStrategy(Strategy):
 
         if not ((asset in question or asset in slug) and '15m' in slug):
             self.log.debug(
-                f"  reject {instrument.id}: question={question!r} slug={slug!r} "
+                f"  reject {self._instrument_label(instrument.id)}: question={question!r} slug={slug!r} "
                 f"doesn't match {asset!r} + 15m"
             )
             return False
@@ -182,7 +184,7 @@ class BtcUpDown15mStrategy(Strategy):
         status = "open" if act_ns <= self.clock.timestamp_ns() else "not open yet"
         self.log.info(
             f"Activated window expiring {exp_dt.isoformat()} ({status}): "
-            f"up={self.active_up_id} down={self.active_down_id}"
+            f"up={self._instrument_label(self.active_up_id)} down={self._instrument_label(self.active_down_id)}"
         )
 
     def on_time_event(self, event) -> None:
@@ -248,7 +250,7 @@ class BtcUpDown15mStrategy(Strategy):
         if instrument is None or not getattr(instrument, "info", None):
             return f"{tail} (no instrument info in cache)"
         slug = instrument.info.get("market_slug", "?")
-        outcome = instrument.outcome or "?"
+        outcome = getattr(instrument, "outcome", None) or "?"
         return f"{tail} [{slug} / {outcome}]"
 
     def _tick_age_secs(self, tick: QuoteTick) -> float:
@@ -306,7 +308,7 @@ class BtcUpDown15mStrategy(Strategy):
     # Resolution + housekeeping — reactive only.
     # ------------------------------------------------------------------ #
     def on_instrument_close(self, data: InstrumentClose) -> None:
-        self.log.info(f"{data.instrument_id} resolved: close_price={data.close_price}")
+        self.log.info(f"{self._instrument_label(data.instrument_id)} resolved: close_price={data.close_price}")
 
     def on_position_closed(self, event: PositionClosed) -> None:
         instrument_id = event.instrument_id
